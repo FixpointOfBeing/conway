@@ -5,7 +5,10 @@
 //! text result. Tools never throw: errors are returned as `ToolOutput` with
 //! `is_error = true` so the model can recover.
 
+pub mod edit;
+pub mod paths;
 pub mod read;
+pub mod write;
 
 use std::path::PathBuf;
 
@@ -57,18 +60,24 @@ impl ToolOutput {
 /// The concrete set of tools conway knows how to execute.
 pub enum Tool {
     Read(read::ReadTool),
+    Edit(edit::EditTool),
+    Write(write::WriteTool),
 }
 
 impl Tool {
     pub fn spec(&self) -> ToolSpec {
         match self {
             Tool::Read(tool) => tool.spec(),
+            Tool::Edit(tool) => tool.spec(),
+            Tool::Write(tool) => tool.spec(),
         }
     }
 
     pub async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolOutput {
         match self {
             Tool::Read(tool) => tool.execute(ctx, args).await,
+            Tool::Edit(tool) => tool.execute(ctx, args).await,
+            Tool::Write(tool) => tool.execute(ctx, args).await,
         }
     }
 }
@@ -81,7 +90,13 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     /// The default coding toolset.
     pub fn coding() -> Self {
-        Self { tools: vec![Tool::Read(read::ReadTool)] }
+        Self {
+            tools: vec![
+                Tool::Read(read::ReadTool),
+                Tool::Edit(edit::EditTool),
+                Tool::Write(write::WriteTool),
+            ],
+        }
     }
 
     /// Prompt metadata for every registered tool.

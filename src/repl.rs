@@ -132,7 +132,12 @@ impl Renderer {
                     println!("● {name} {args}");
                 }
             },
-            AgentEvent::ToolEnd { name: _, output, is_error, .. } => {
+            AgentEvent::ToolEnd { name, output, is_error, .. } => {
+                // The `read` tool returns file contents; don't dump them to the
+                // terminal. Errors (for example a missing file) still show.
+                if name == "read" && !is_error {
+                    return;
+                }
                 let marker = if is_error { "✗" } else { "⎿" };
                 let preview = preview_output(&output);
                 if is_error && self.color {
