@@ -1,0 +1,32 @@
+edition = "2024"
+
+# 每行最大字符数
+max_width = 100
+
+# 使用 Unix 风格换行符（LF）
+newline_style = "Unix"
+
+# 缩进使用 4 个空格
+tab_spaces = 4
+
+# 小型代码块的格式化策略
+# Max 表示尽量保持较紧凑的单行格式
+use_small_heuristics = "Max"
+
+# 自动重新排序 use 导入
+# 按字母顺序排列
+reorder_imports = true
+
+# match block 最后一项添加 trailing comma
+match_block_trailing_comma = true
+
+# 链式调用最大宽度
+chain_width = 70
+
+# 数组/元组表达式最大宽度
+array_width = 70
+
+# 删除多余的嵌套括号
+remove_nested_parens = true
+
+# imports_granularity = "Item"
