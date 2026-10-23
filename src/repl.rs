@@ -1,12 +1,14 @@
-//! Line-oriented REPL: reads a prompt from stdin and streams the model's reply.
+//! Line-oriented REPL: reads a prompt from stdin and runs the agent loop,
+//! streaming the model's reply and any tool calls.
 
-use futures_util::StreamExt;
 use std::io::{self, IsTerminal, Write};
 use tokio::io::AsyncBufReadExt;
 
-use crate::llm::{Input, InputItem, LlmClient, Response, ResponseRequest, ResponseStatus};
+use crate::agent::{self, AgentEvent};
+use crate::llm::{InputItem, LlmClient, ResponseStatus};
 use crate::prompt;
 use crate::provider_config::read_config;
+use crate::tools::ToolRegistry;
 
 const BANNER: &str = r#"
   ___ ___  _ ____      ____ _ _   _
@@ -29,7 +31,8 @@ pub async fn run_with_client(client: LlmClient) -> Result<(), Box<dyn std::error
     let color = io::stdout().is_terminal();
 
     let cwd = std::env::current_dir()?;
-    let system_prompt = prompt::build_system_prompt(&cwd);
+    let registry = ToolRegistry::coding();
+    let system_prompt = prompt::build_system_prompt(&cwd, &registry.specs());
 
     let (accent, reset) = if color { ("\x1b[36m", "\x1b[0m") } else { ("", "") };
     println!("{accent}{BANNER}{reset}");
@@ -65,78 +68,20 @@ pub async fn run_with_client(client: LlmClient) -> Result<(), Box<dyn std::error
             _ => {},
         }
 
-        // The Responses API is stateless: send the whole conversation each turn.
+        // The Responses API is stateless: the agent loop resends the whole
+        // conversation each model request.
         history.push(InputItem::user(input));
-        let request = ResponseRequest::new(client.model())
-            .instructions(system_prompt.clone())
-            .input(Input::Items(history.clone()));
 
-        let mut stream = match client.create_stream(request).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                eprintln!("请求失败: {err}\n");
-                continue;
-            },
-        };
+        let mut renderer = Renderer::new(color);
+        let result =
+            agent::run_turn(&client, &registry, &system_prompt, &cwd, &mut history, |event| {
+                renderer.event(event)
+            })
+            .await;
+        renderer.finish();
 
-        let mut reasoning_started = false;
-        let mut text_started = false;
-        // Fallback in case the terminal event does not carry the full response.
-        let mut pending_items: Vec<InputItem> = Vec::new();
-
-        while let Some(event) = stream.next().await {
-            let event = match event {
-                Ok(event) => event,
-                Err(err) => {
-                    eprintln!("\n流中断: {err}");
-                    break;
-                },
-            };
-
-            if event.is_reasoning_delta()
-                && let Some(delta) = event.delta_text()
-            {
-                if !reasoning_started {
-                    if color {
-                        print!("\x1b[2m");
-                    } else {
-                        print!("[reasoning] ");
-                    }
-                }
-                reasoning_started = true;
-                print!("{delta}");
-                io::stdout().flush()?;
-            } else if event.is_output_text_delta()
-                && let Some(delta) = event.delta_text()
-            {
-                if reasoning_started && !text_started {
-                    if color {
-                        println!("\x1b[0m");
-                    } else {
-                        println!();
-                    }
-                }
-                text_started = true;
-                print!("{delta}");
-                io::stdout().flush()?;
-            }
-
-            if event.kind == "response.output_item.done"
-                && let Some(item) = &event.item
-            {
-                pending_items.push(InputItem::from(item));
-            }
-
-            if event.is_terminal() {
-                if (reasoning_started || text_started) && color {
-                    print!("\x1b[0m");
-                }
-                println!();
-
-                record_turn(event.response.as_ref(), &mut pending_items, &mut history);
-                print_usage(event.response.as_ref());
-                break;
-            }
+        if let Err(error) = result {
+            eprintln!("请求失败: {error}\n");
         }
 
         println!();
@@ -145,78 +90,147 @@ pub async fn run_with_client(client: LlmClient) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-/// Appends the assistant turn to the history so the next request has context.
-fn record_turn(
-    response: Option<&Response>,
-    pending_items: &mut Vec<InputItem>,
-    history: &mut Vec<InputItem>,
-) {
-    if let Some(response) = response {
-        if response.status != ResponseStatus::Completed {
-            eprintln!("响应未正常完成: {:?}", response.status);
-            if let Some(error) = &response.error {
-                eprintln!("错误: {:?} {:?}", error.code, error.message);
-            }
-        }
-
-        if !response.output.is_empty() {
-            history.extend(response.output.iter().map(InputItem::from));
-            return;
-        }
-    }
-
-    history.append(pending_items);
+/// Renders agent events to the terminal, keeping the reasoning/text stream
+/// transitions clean around tool calls.
+struct Renderer {
+    color: bool,
+    reasoning: bool,
+    text: bool,
 }
 
-fn print_usage(response: Option<&Response>) {
-    if let Some(usage) = response.and_then(|response| response.usage.as_ref()) {
-        println!(
-            "[tokens: in {} · out {} · total {}]",
-            usage.input_tokens, usage.output_tokens, usage.total_tokens
-        );
+impl Renderer {
+    fn new(color: bool) -> Self {
+        Self { color, reasoning: false, text: false }
     }
+
+    fn event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::ReasoningDelta(delta) => {
+                if !self.reasoning {
+                    self.reasoning = true;
+                    if self.color {
+                        print!("\x1b[2m");
+                    } else {
+                        print!("[reasoning] ");
+                    }
+                }
+                print!("{delta}");
+            },
+            AgentEvent::TextDelta(delta) => {
+                if self.reasoning && !self.text {
+                    self.end_stream();
+                }
+                self.text = true;
+                print!("{delta}");
+            },
+            AgentEvent::ToolStart { name, arguments, .. } => {
+                self.end_stream();
+                let args = truncate_chars(&arguments, 160);
+                if self.color {
+                    println!("\x1b[36m● {name} {args}\x1b[0m");
+                } else {
+                    println!("● {name} {args}");
+                }
+            },
+            AgentEvent::ToolEnd { name: _, output, is_error, .. } => {
+                let marker = if is_error { "✗" } else { "⎿" };
+                let preview = preview_output(&output);
+                if is_error && self.color {
+                    println!("{marker} \x1b[31m{preview}\x1b[0m");
+                } else {
+                    println!("{marker} {preview}");
+                }
+            },
+            AgentEvent::TurnEnd { response } => {
+                self.end_stream();
+                if response.status != ResponseStatus::Completed {
+                    match &response.error {
+                        Some(error) => eprintln!(
+                            "响应未正常完成: {:?} ({:?})",
+                            response.status,
+                            error
+                                .message
+                                .as_deref()
+                                .unwrap_or(error.code.as_deref().unwrap_or("unknown"))
+                        ),
+                        None => eprintln!("响应未正常完成: {:?}", response.status),
+                    }
+                }
+                if let Some(usage) = &response.usage {
+                    println!(
+                        "[tokens: in {} · out {} · total {}]",
+                        usage.input_tokens, usage.output_tokens, usage.total_tokens
+                    );
+                }
+            },
+        }
+    }
+
+    fn end_stream(&mut self) {
+        if self.reasoning || self.text {
+            if self.color {
+                print!("\x1b[0m");
+            }
+            println!();
+        }
+        self.reasoning = false;
+        self.text = false;
+    }
+
+    fn finish(&mut self) {
+        self.end_stream();
+    }
+}
+
+/// Truncate a string to `max` chars, appending an ellipsis when cut.
+fn truncate_chars(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        text.to_string()
+    } else {
+        format!("{}…", chars[..max].iter().collect::<String>())
+    }
+}
+
+/// Show at most `max_lines` lines of a tool result, each capped to `max_chars`.
+fn preview_output(text: &str) -> String {
+    let max_lines = 20;
+    let max_chars = 120;
+
+    let mut out = String::new();
+    let mut lines = text.lines();
+    for line in lines.by_ref().take(max_lines) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&truncate_chars(line, max_chars));
+    }
+    if lines.next().is_some() {
+        out.push_str("\n…");
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn response(json: &str) -> Response {
-        serde_json::from_str(json).expect("test response parses")
+    #[test]
+    fn truncate_chars_leaves_short_strings_alone() {
+        assert_eq!(truncate_chars("abc", 10), "abc");
     }
 
     #[test]
-    fn record_turn_appends_the_response_output() {
-        let response = response(
-            r#"{
-                "status": "completed",
-                "output": [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "hello"}]
-                }]
-            }"#,
-        );
-        let mut pending = vec![InputItem::user("fallback")];
-        let mut history = vec![InputItem::user("hi")];
-
-        record_turn(Some(&response), &mut pending, &mut history);
-
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[1].0["type"], "message");
-        assert_eq!(history[1].0["content"][0]["text"], "hello");
-        assert_eq!(pending.len(), 1, "pending items are unused when output exists");
+    fn truncate_chars_adds_an_ellipsis() {
+        assert_eq!(truncate_chars("abcdef", 3), "abc…");
     }
 
     #[test]
-    fn record_turn_falls_back_to_pending_items() {
-        let mut pending = vec![InputItem::user("from events")];
-        let mut history = vec![InputItem::user("hi")];
+    fn preview_output_caps_lines_and_width() {
+        let text = "a".repeat(200) + "\n" + &"b".repeat(5) + "\n" + &"c".repeat(5);
+        let preview = preview_output(&text);
 
-        let empty = response(r#"{"status":"completed","output":[]}"#);
-        record_turn(Some(&empty), &mut pending, &mut history);
-
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[1].0["content"][0]["text"], "from events");
+        assert!(preview.contains('…'));
+        assert!(preview.lines().count() <= 20);
     }
 }

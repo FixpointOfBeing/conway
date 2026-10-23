@@ -38,6 +38,16 @@ pub enum LlmError {
 /// A boxed SSE stream of [`StreamEvent`]s.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, LlmError>> + Send>>;
 
+/// Model-facing abstraction over the provider client, so the agent loop can be
+/// exercised with canned responses in tests.
+pub trait ChatClient: Send + Sync {
+    fn model_name(&self) -> &str;
+    fn stream(
+        &self,
+        request: ResponseRequest,
+    ) -> impl std::future::Future<Output = Result<EventStream, LlmError>> + Send;
+}
+
 pub struct LlmClient {
     http: reqwest::Client,
     endpoint: String,
@@ -173,9 +183,40 @@ impl LlmClient {
     }
 }
 
+impl ChatClient for LlmClient {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    async fn stream(&self, request: ResponseRequest) -> Result<EventStream, LlmError> {
+        self.create_stream(request).await
+    }
+}
+
 fn responses_endpoint(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     if base.ends_with("/responses") { base.to_string() } else { format!("{base}/responses") }
+}
+
+/// A function tool declaration in the Responses API shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl ToolDefinition {
+    pub fn function(name: &str, description: &str, parameters: Value) -> Self {
+        Self {
+            kind: "function".to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters,
+        }
+    }
 }
 
 /// Request body accepted by `POST {base_url}/responses`.
@@ -186,6 +227,8 @@ pub struct ResponseRequest {
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Input>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDefinition>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +245,7 @@ impl ResponseRequest {
             model: model.into(),
             instructions: None,
             input: None,
+            tools: None,
             reasoning: None,
             max_output_tokens: None,
             temperature: None,
@@ -221,6 +265,11 @@ impl ResponseRequest {
 
     pub fn input_items(mut self, items: impl IntoIterator<Item = InputItem>) -> Self {
         self.input = Some(Input::Items(items.into_iter().collect()));
+        self
+    }
+
+    pub fn tools(mut self, tools: impl IntoIterator<Item = ToolDefinition>) -> Self {
+        self.tools = Some(tools.into_iter().collect());
         self
     }
 
@@ -300,6 +349,22 @@ impl InputItem {
 
     pub fn raw(value: Value) -> Self {
         Self(value)
+    }
+
+    pub fn kind(&self) -> Option<&str> {
+        self.0.get("type").and_then(Value::as_str)
+    }
+
+    pub fn call_id(&self) -> Option<&str> {
+        self.0.get("call_id").and_then(Value::as_str)
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.0.get("name").and_then(Value::as_str)
+    }
+
+    pub fn arguments(&self) -> Option<&str> {
+        self.0.get("arguments").and_then(Value::as_str)
     }
 }
 
@@ -575,6 +640,19 @@ mod tests {
         assert_eq!(value["type"], "function_call_output");
         assert_eq!(value["call_id"], "call_1");
         assert_eq!(value["output"], "42");
+    }
+
+    #[test]
+    fn serializes_tool_definitions() {
+        let tool =
+            ToolDefinition::function("read", "Read a file", serde_json::json!({"type": "object"}));
+        let request = ResponseRequest::new("m").tools([tool]);
+
+        let value = serde_json::to_value(request).expect("request serializes");
+
+        assert_eq!(value["tools"][0]["type"], "function");
+        assert_eq!(value["tools"][0]["name"], "read");
+        assert_eq!(value["tools"][0]["parameters"]["type"], "object");
     }
 
     #[test]
